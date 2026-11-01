@@ -129,8 +129,8 @@ export default function TrainPage() {
   const [logOpen, setLogOpen] = useState(false);
 
   const running = status?.status === "running" || status?.status === "busy_starting";
-  // MeloTTS 暂停态：进程已退出、检查点已保存，可继续
-  const paused = modelType === "melotts" && status?.status === "paused";
+  // 暂停态：进程已退出、检查点已保存，可继续（两类训练同语义）
+  const paused = status?.status === "paused";
   const progressPercent = status
     ? Math.min(100, Math.max(0, Math.round(status.progress * 100)))
     : 0;
@@ -325,7 +325,10 @@ export default function TrainPage() {
     setNotice(null);
     setBusy(true);
     try {
-      const res = await api.pauseMelottsTrain();
+      const res =
+        modelType === "sovits"
+          ? await api.pauseSovitsTrain()
+          : await api.pauseMelottsTrain();
       setNotice(res.message);
       refresh();
     } catch (e) {
@@ -340,7 +343,10 @@ export default function TrainPage() {
     setNotice(null);
     setBusy(true);
     try {
-      const res = await api.resumeMelottsTrain();
+      const res =
+        modelType === "sovits"
+          ? await api.resumeSovitsTrain()
+          : await api.resumeMelottsTrain();
       setNotice(res.message);
       refresh();
     } catch (e) {
@@ -451,26 +457,22 @@ export default function TrainPage() {
         </div>
         {status?.message ? <p className="muted">信息：{status.message}</p> : null}
         <div className="form-actions">
-          {modelType === "melotts" ? (
-            <>
-              <button
-                type="button"
-                className="btn btn-ghost"
-                disabled={busy || status?.status !== "running"}
-                onClick={() => void handlePause()}
-              >
-                暂停训练
-              </button>
-              <button
-                type="button"
-                className="btn btn-primary"
-                disabled={busy || !paused}
-                onClick={() => void handleResume()}
-              >
-                继续训练
-              </button>
-            </>
-          ) : null}
+          <button
+            type="button"
+            className="btn btn-ghost"
+            disabled={busy || status?.status !== "running"}
+            onClick={() => void handlePause()}
+          >
+            暂停训练
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            disabled={busy || !paused}
+            onClick={() => void handleResume()}
+          >
+            继续训练
+          </button>
           <button
             type="button"
             className="btn btn-danger"

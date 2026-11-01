@@ -504,6 +504,16 @@ export const api = {
   stopTrain: () =>
     request<MessageResult>("/api/sovits-svc/stop", { method: "POST" }),
 
+  /** 暂停训练（epoch 边界存盘退出，可用 resume 继续） */
+  pauseSovitsTrain: () =>
+    request<MessageResult & { train?: TrainStatus }>("/api/sovits-svc/pause", {
+      method: "POST",
+    }),
+
+  /** 继续训练（从暂停时保存的检查点恢复） */
+  resumeSovitsTrain: () =>
+    request<TrainStartResult>("/api/sovits-svc/resume", { method: "POST" }),
+
   getTrainStatus: () => request<TrainStatus>("/api/sovits-svc/status"),
 
   listModels: () => request<ModelsResult>("/api/sovits-svc/models"),

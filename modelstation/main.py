@@ -42,7 +42,8 @@ async def _shutdown_resources():
         from modelstation.api import sovits_svc as sovits_api
         trainer = sovits_api._trainer_instance
         if trainer is not None:
-            await trainer.stop_training()
+            # 应用关闭时保留可续训状态：下次启动可从最近检查点继续训练
+            await trainer.stop_training(preserve_resume=True)
     except Exception as e:
         logger.warning(f"Shutdown: failed to stop So-VITS-SVC training: {e}")
     try:

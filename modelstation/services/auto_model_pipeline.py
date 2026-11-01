@@ -1435,6 +1435,13 @@ class AutoModelPipelineService:
                 terminal["status"] = status
                 terminal["message"] = str(kw.get("message") or "")
                 terminal_event.set()
+            elif status == "paused":
+                # 用户暂停：主循环跳过 Loss 判停，等待 resume 后继续
+                terminal["status"] = "paused"
+                terminal["message"] = str(kw.get("message") or "")
+            elif terminal["status"] == "paused":
+                # 暂停后恢复：进度回调重新出现，清除暂停标记恢复判停
+                terminal["status"] = "running"
 
         try:
             task_id = await trainer.start_training(
@@ -1460,6 +1467,27 @@ class AutoModelPipelineService:
         sentinel_deadline = 0.0
         try:
             while not terminal_event.is_set():
+                # 管道自身回调在暂停后不会被 resume 复用（续训走 API 回调），
+                # 因此同时轮询共享训练状态（按 task_id 对齐）同步暂停/终态。
+                snapshot = sovits_svc_api.get_train_status_snapshot()
+                if str(snapshot.get("task_id") or "") == str(task_id):
+                    shared_status = str(snapshot.get("status") or "")
+                    # 续训阶段的进度经 API 回调写共享状态，这里回填到 run 快照
+                    run["training"]["progress"] = float(snapshot.get("progress") or 0.0)
+                    run["training"]["epoch"] = int(snapshot.get("epoch") or 0)
+                    if shared_status == "paused":
+                        terminal["status"] = "paused"
+                    elif shared_status == "running" and terminal["status"] == "paused":
+                        terminal["status"] = "running"
+                    elif shared_status in ("completed", "failed"):
+                        terminal["status"] = shared_status
+                        terminal["message"] = str(snapshot.get("message") or "")
+                        terminal_event.set()
+                        continue
+                if terminal["status"] == "paused":
+                    # 用户暂停：日志不再增长，跳过损失判停，等待恢复
+                    await asyncio.sleep(_TRAIN_POLL_SECONDS)
+                    continue
                 if stop_requested:
                     # 哨兵已写：等引擎下一个 epoch 边界存盘退出；超时未退才强杀兜底
                     if time.monotonic() >= sentinel_deadline:

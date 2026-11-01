@@ -10,6 +10,8 @@ vi.mock("../api/client", () => ({
     preprocess: vi.fn(),
     startTrain: vi.fn(),
     stopTrain: vi.fn(),
+    pauseSovitsTrain: vi.fn(),
+    resumeSovitsTrain: vi.fn(),
     getMelottsStatus: vi.fn(),
     melottsPreprocess: vi.fn(),
     startMelottsTrain: vi.fn(),
@@ -352,6 +354,59 @@ describe("TrainPage", () => {
     fireEvent.click(resumeBtn);
 
     await waitFor(() => expect(mockedApi.resumeMelottsTrain).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("训练已继续")).toBeInTheDocument();
+  });
+
+  it("交互：So-VITS-SVC 训练中点暂停调用 sovits pause 接口", async () => {
+    mockedApi.getTrainStatus.mockResolvedValue({
+      task_id: "svc-pause",
+      status: "running",
+      progress: 0.2,
+      epoch: 20,
+      total_epochs: 100,
+      message: "训练进行中（epoch 20/100）",
+      models: [],
+    });
+    mockedApi.pauseSovitsTrain.mockResolvedValue({
+      status: "success",
+      message: "训练已暂停（epoch 20），检查点已保存，可稍后继续训练",
+    });
+
+    render(<TrainPage />);
+    await screen.findByText("训练状态（So-VITS-SVC）");
+    await screen.findByText(/训练进行中（epoch 20\/100）/);
+
+    fireEvent.click(screen.getByRole("button", { name: "暂停训练" }));
+    await waitFor(() => expect(mockedApi.pauseSovitsTrain).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/训练已暂停（epoch 20）/)).toBeInTheDocument();
+  });
+
+  it("交互：So-VITS-SVC 暂停态可点继续训练并调用 sovits resume 接口", async () => {
+    mockedApi.getTrainStatus.mockResolvedValue({
+      task_id: "svc-resume",
+      status: "paused",
+      progress: 0.3,
+      epoch: 30,
+      total_epochs: 100,
+      message: "训练已暂停（epoch 30），检查点已保存，可稍后继续训练",
+      models: [],
+    });
+    mockedApi.resumeSovitsTrain.mockResolvedValue({
+      status: "success",
+      task_id: "svc-resume",
+      message: "训练已继续",
+    });
+
+    render(<TrainPage />);
+    await screen.findByText("训练状态（So-VITS-SVC）");
+    await screen.findByText(/训练已暂停（epoch 30）/);
+
+    const resumeBtn = screen.getByRole("button", { name: "继续训练" });
+    expect(resumeBtn).toBeEnabled();
+    expect(screen.getByRole("button", { name: "暂停训练" })).toBeDisabled();
+    fireEvent.click(resumeBtn);
+
+    await waitFor(() => expect(mockedApi.resumeSovitsTrain).toHaveBeenCalledTimes(1));
     expect(await screen.findByText("训练已继续")).toBeInTheDocument();
   });
 

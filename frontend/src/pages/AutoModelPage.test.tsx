@@ -12,8 +12,11 @@ vi.mock("../api/client", () => ({
     previewDatasetReference: vi.fn(),
     getBatchTask: vi.fn(),
     getMelottsStatus: vi.fn(),
+    getTrainStatus: vi.fn(),
     pauseMelottsTrain: vi.fn(),
     resumeMelottsTrain: vi.fn(),
+    pauseSovitsTrain: vi.fn(),
+    resumeSovitsTrain: vi.fn(),
     getMelottsLog: vi.fn(),
     getAudioFileUrl: vi.fn(
       (category: string, ...segments: string[]) =>

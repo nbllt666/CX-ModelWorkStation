@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from collections import deque
 from pathlib import Path
@@ -47,6 +48,13 @@ _TRAIN_STOP_WAIT_TIMEOUT = 10.0
 _EPOCH_FILE_POLL_SECONDS = 5.0
 _EPOCH_LOG_TAIL_BYTES = 65536
 _EPOCH_LOG_PATTERN = re.compile(r"(?:Train Epoch|====> Epoch):\s*(\d+)")
+
+# 可续训状态落盘：应用关闭后进程内上下文丢失，需在引擎 logs 目录保留
+# train_state.json；重启时据此恢复 paused 态（继续训练入口）。
+_TRAIN_STATE_FILENAME = "train_state.json"
+_RESUMABLE_STATE_STATUSES = frozenset({"paused", "running", "busy_starting"})
+# 引擎现有优雅退出哨兵（train.py 在 epoch 边界存盘后退出）；暂停复用该哨兵
+_STOP_SENTINEL_NAME = ".stop_requested"
 
 
 def _parse_last_epoch_from_file(log_path: Optional[Path]) -> int:
@@ -141,6 +149,10 @@ class SoVITSSVCTrainer:
         self._task_id: Optional[str] = None
         self._preprocessed: set[str] = set()
         self._monitor_task: Optional[asyncio.Task] = None
+        # 暂停/继续上下文：进程优雅退出后保留拉起训练所需的全部参数
+        self._active_ctx: Optional[dict] = None
+        # 用户主动暂停标记：区分 .stop_requested（用户暂停 vs 判停停止）
+        self._pause_requested = False
 
     @property
     def training_data_dir(self) -> Path:
@@ -269,6 +281,142 @@ class SoVITSSVCTrainer:
         with open(target_path, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
 
+    async def _spawn_train(self, args: list[str]) -> asyncio.subprocess.Process:
+        """启动训练子进程（独立方法便于测试注入 mock 进程）。"""
+        return await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self._so_vits_svc_dir),
+            env=_engine_env(),
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+        )
+
+    def _train_state_path(self, output_name: str) -> Path:
+        """可续训状态文件路径（与引擎检查点同目录：logs/<output_name>/）。"""
+        return self._so_vits_svc_dir / "logs" / output_name / _TRAIN_STATE_FILENAME
+
+    def _persist_train_state(
+        self,
+        status: str,
+        *,
+        ctx: Optional[dict] = None,
+        epoch: Optional[int] = None,
+    ) -> None:
+        """把续训所需上下文原子落盘；失败仅告警，不影响训练主链路。"""
+        context = dict(ctx or self._active_ctx or {})
+        output_name = str(context.get("output_name") or "")
+        if not output_name:
+            return
+        if epoch is not None:
+            default_epoch = int(epoch)
+        else:
+            log_dir_value = str(context.get("log_dir") or "")
+            default_epoch = (
+                _parse_last_epoch_from_file(Path(log_dir_value) / "train.log")
+                if log_dir_value
+                else 0
+            )
+        payload = {
+            "task_id": context.get("task_id"),
+            "output_name": output_name,
+            "epochs": int(context.get("epochs") or 0),
+            "batch_size": int(context.get("batch_size") or 0),
+            "learning_rate": float(context.get("learning_rate") or 0.0),
+            "eval_interval": context.get("eval_interval"),
+            "config_path": str(context.get("config_path") or ""),
+            "log_dir": str(context.get("log_dir") or ""),
+            "status": status,
+            "epoch": default_epoch,
+            "updated_at": time.time(),
+        }
+        path = self._train_state_path(output_name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("写入续训状态失败（忽略）: %s (%s)", path, exc)
+
+    def restore_resumable_training(self) -> Optional[dict]:
+        """应用重启后恢复最近一次未完成训练为 paused，返回状态快照（无可恢复时 None）。
+
+        进程内上下文随应用关闭丢失，这里只读 logs/<output_name>/train_state.json；
+        仅看最近一次训练会话（updated_at 最大），避免把历史暂停任务翻出来。
+        """
+        if self._active_ctx is not None:
+            return None
+        logs_root = self._so_vits_svc_dir / "logs"
+        if not logs_root.is_dir():
+            return None
+        latest: Optional[tuple[float, Path, dict]] = None
+        for state_path in logs_root.glob(f"*/{_TRAIN_STATE_FILENAME}"):
+            try:
+                data = json.loads(state_path.read_text(encoding="utf-8"))
+                updated = float(data.get("updated_at") or 0.0)
+            except (OSError, ValueError, TypeError):
+                continue
+            if latest is None or updated > latest[0]:
+                latest = (updated, state_path, data)
+        if latest is None:
+            return None
+        _, state_path, data = latest
+        output_name = state_path.parent.name
+        try:
+            _sanitize_output_name(output_name)
+        except ValueError:
+            return None
+        if str(data.get("status") or "") not in _RESUMABLE_STATE_STATUSES:
+            return None
+        try:
+            epochs = int(data.get("epochs") or 0)
+            batch_size = int(data.get("batch_size") or 0)
+            stored_epoch = int(data.get("epoch") or 0)
+        except (TypeError, ValueError):
+            return None
+        config_path = Path(str(data.get("config_path") or ""))
+        log_dir = state_path.parent
+        if epochs < 1 or not config_path.is_file():
+            return None
+        if not any(log_dir.glob("G_*.pth")):
+            return None
+
+        epoch = max(_parse_last_epoch_from_file(log_dir / "train.log"), stored_epoch)
+        progress = min(epoch / epochs, 1.0) if epochs > 0 else 0.0
+        self._active_ctx = {
+            "task_id": data.get("task_id") or str(uuid.uuid4()),
+            "output_name": output_name,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": float(data.get("learning_rate") or 0.0),
+            "eval_interval": data.get("eval_interval"),
+            "config_path": str(config_path),
+            "log_dir": str(log_dir),
+        }
+        self._task_id = self._active_ctx["task_id"]
+        logger.info(
+            "已恢复可续训的 So-VITS-SVC 训练: output=%s epoch=%d state=%s",
+            output_name, epoch, state_path,
+        )
+        return {
+            "task_id": self._active_ctx["task_id"],
+            "status": "paused",
+            "progress": progress,
+            "epoch": epoch,
+            "total_epochs": epochs,
+            "message": (
+                f"检测到上次未完成的训练 {output_name}（epoch {epoch}），"
+                "检查点已就绪，可点击「继续训练」从该检查点恢复"
+            ),
+        }
+
+    def can_resume(self) -> bool:
+        """当前是否处于可继续的暂停态（进程已退出且上下文仍在）。"""
+        return self._active_ctx is not None and self._process is None
+
     async def start_training(
         self,
         epochs: int = 10000,
@@ -320,6 +468,13 @@ class SoVITSSVCTrainer:
         # batch 只影响该配置文件，故 OOM 降批重试可复用同一入口重新拉起进程。
         runtime_config_path = output_path / "config.json"
 
+        args = [
+            self._python_path,
+            "train.py",
+            "-c", str(runtime_config_path),
+            "-m", model_name,
+        ]
+
         async def _spawn_with_batch(batch: int) -> asyncio.subprocess.Process:
             """按给定 batch 重写运行配置并拉起训练子进程。"""
             self._write_runtime_config(
@@ -330,14 +485,11 @@ class SoVITSSVCTrainer:
                 learning_rate=learning_rate,
                 eval_interval=eval_interval,
             )
-            return await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(self._so_vits_svc_dir),
-                env=_engine_env(),
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
-            )
+            if self._active_ctx is not None:
+                self._active_ctx["batch_size"] = int(batch)
+                # OOM 降批后同步落盘，重启续训沿用新的 batch
+                self._persist_train_state("running")
+            return await self._spawn_train(args)
 
         logger.info(f"Starting So-VITS-SVC training: {self._task_id}")
         logger.info(f"  Training data: {self._training_data_dir}")
@@ -345,15 +497,28 @@ class SoVITSSVCTrainer:
         logger.info(f"  Epochs: {epochs}, Batch size: {batch_size}, LR: {learning_rate}")
         logger.info(f"  Runtime config: {runtime_config_path}")
 
-        args = [
-            self._python_path,
-            "train.py",
-            "-c", str(runtime_config_path),
-            "-m", model_name,
-        ]
-
-        proc = await _spawn_with_batch(batch_size)
+        # 暂停/继续上下文：应用重启后按磁盘状态恢复（train_state.json）
+        self._active_ctx = {
+            "task_id": self._task_id,
+            "output_name": model_name,
+            "epochs": int(epochs),
+            "batch_size": int(batch_size),
+            "learning_rate": float(learning_rate),
+            "eval_interval": eval_interval,
+            "config_path": str(runtime_config_path.resolve()),
+            "log_dir": str((self._so_vits_svc_dir / "logs" / model_name).resolve()),
+        }
+        self._pause_requested = False
+        # 先落盘再拉起进程：应用被强杀（Electron taskkill /T）时也能恢复
+        self._persist_train_state("busy_starting", epoch=0)
+        try:
+            proc = await _spawn_with_batch(batch_size)
+        except BaseException:
+            self._persist_train_state("failed")
+            self._active_ctx = None
+            raise
         self._process = proc
+        self._persist_train_state("running", epoch=0)
 
         self._monitor_task = asyncio.create_task(
             self._monitor_training(
@@ -514,18 +679,8 @@ class SoVITSSVCTrainer:
                 message = monitor_error
                 break
             if returncode == 0:
-                # 产物收集：引擎 logs/<name> → models_dir/<name>（收集失败按训练失败上报，
-                # 避免"训练成功但模型列表为空"的静默不一致）
-                try:
-                    dst = self._collect_outputs(output_name or "")
-                    message = f"训练完成，产物已收集至 {dst}"
-                    logger.info(
-                        "So-VITS-SVC training completed: task_id=%s -> %s", self._task_id, dst
-                    )
-                except Exception as exc:
-                    returncode = -1
-                    message = f"训练子进程正常退出但产物收集失败: {exc}"
-                    logger.error("So-VITS-SVC output collection failed: %s", exc)
+                # 正常退出：暂停与完成在收尾阶段区分（暂停看 .stop_requested 标记）
+                message = ""
                 break
             # OOM 降批重试（仅一次）：自适应估算偏乐观时兜底，避免整轮训练白跑
             if (
@@ -562,23 +717,204 @@ class SoVITSSVCTrainer:
         epoch_file_task.cancel()
         await asyncio.gather(epoch_file_task, return_exceptions=True)
 
+        # 终态回填前补一次文件解析：最后一次 epoch 行可能落在轮询间隔内
+        final_epoch = max(current_epoch, _parse_last_epoch_from_file(epoch_log_path))
+        log_dir = epoch_log_path.parent if epoch_log_path is not None else None
+        paused = (
+            returncode == 0
+            and self._pause_requested
+            and (total_epochs <= 0 or final_epoch < total_epochs)
+        )
+        if paused:
+            # 用户主动暂停：清理哨兵；保留检查点与上下文供继续训练，不收集产物
+            if log_dir is not None:
+                try:
+                    (log_dir / _STOP_SENTINEL_NAME).unlink()
+                except FileNotFoundError:
+                    pass
+            message = (
+                f"训练已暂停（epoch {final_epoch}），检查点已保存，可稍后继续训练"
+            )
+            self._pause_requested = False
+            self._persist_train_state("paused", epoch=final_epoch)
+        elif returncode == 0:
+            # 产物收集：引擎 logs/<name> → models_dir/<name>（收集失败按训练失败上报，
+            # 避免"训练成功但模型列表为空"的静默不一致）
+            try:
+                dst = self._collect_outputs(output_name or "")
+                message = f"训练完成，产物已收集至 {dst}"
+                logger.info(
+                    "So-VITS-SVC training completed: task_id=%s -> %s", self._task_id, dst
+                )
+            except Exception as exc:
+                returncode = -1
+                message = f"训练子进程正常退出但产物收集失败: {exc}"
+                logger.error("So-VITS-SVC output collection failed: %s", exc)
+            self._pause_requested = False
+            self._persist_train_state(
+                "completed" if returncode == 0 else "failed", epoch=final_epoch
+            )
+            self._active_ctx = None
+        else:
+            self._pause_requested = False
+            if not message:
+                message = f"训练子进程异常退出（exit={returncode}）"
+            self._persist_train_state("failed", epoch=final_epoch)
+            self._active_ctx = None
+
         if progress_callback:
             try:
-                # 终态回填前补一次文件解析：最后一次 epoch 行可能落在轮询间隔内
-                final_epoch = max(
-                    current_epoch, _parse_last_epoch_from_file(epoch_log_path)
-                )
                 progress_callback(
-                    progress=1.0 if returncode == 0 else 0.0,
+                    progress=(
+                        min(final_epoch / total_epochs, 1.0)
+                        if paused
+                        else (1.0 if returncode == 0 else 0.0)
+                    ),
                     epoch=final_epoch,
                     total_epochs=total_epochs,
-                    status="completed" if returncode == 0 else "failed",
+                    status=(
+                        "paused"
+                        if paused
+                        else ("completed" if returncode == 0 else "failed")
+                    ),
                     message=message,
                 )
             except Exception as e:
                 logger.warning(f"Progress callback error: {e}")
 
-    async def stop_training(self):
+        # 终态复位进程句柄（暂停态保留上下文供 resume 复用）
+        self._process = None
+        if self._monitor_task is asyncio.current_task():
+            self._monitor_task = None
+
+    async def pause_training(self, timeout: float = 120.0) -> dict:
+        """暂停训练：写 .stop_requested 哨兵，等引擎在 epoch 边界存盘退出。
+
+        返回暂停后的状态快照（status=paused）。训练进程退出但保留检查点，
+        可随后调用 resume_training 从最近检查点继续。
+        """
+        process = self._process
+        if (
+            self._active_ctx is None
+            or process is None
+            or process.returncode is not None
+        ):
+            raise ValueError("当前没有正在运行的 So-VITS-SVC 训练任务")
+        ctx = dict(self._active_ctx)
+        log_dir = Path(ctx["log_dir"])
+        sentinel = log_dir / _STOP_SENTINEL_NAME
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        self._pause_requested = True
+        sentinel.write_text("", encoding="utf-8")
+        logger.info("已写入暂停哨兵: %s", sentinel)
+
+        monitor = self._monitor_task
+        try:
+            if monitor is not None:
+                # shield：超时仅结束等待，不取消监控（由下方强制停止兜底）
+                await asyncio.wait_for(asyncio.shield(monitor), timeout=max(1.0, float(timeout)))
+        except asyncio.TimeoutError:
+            logger.warning("暂停哨兵未在 %.0fs 内生效，退回强制停止（保留检查点）", timeout)
+            await self.stop_training(preserve_resume=True)
+            raise RuntimeError("暂停超时，已强制停止训练（产物取最近检查点）")
+
+        if self._active_ctx is None:
+            # 引擎在暂停生效前已自然到顶/失败：状态由监控回填，清理残留哨兵
+            self._pause_requested = False
+            try:
+                sentinel.unlink()
+            except FileNotFoundError:
+                pass
+            raise RuntimeError("训练已在暂停前结束，无可继续的检查点")
+
+        epoch = _parse_last_epoch_from_file(log_dir / "train.log")
+        epochs = int(ctx["epochs"])
+        progress = min(epoch / epochs, 1.0) if epochs > 0 else 0.0
+        return {
+            "status": "paused",
+            "task_id": ctx["task_id"],
+            "progress": progress,
+            "epoch": epoch,
+            "total_epochs": epochs,
+            "message": f"训练已暂停（epoch {epoch}），检查点已保存，可稍后继续训练",
+        }
+
+    async def resume_training(
+        self, progress_callback: Optional[Callable] = None
+    ) -> str:
+        """从暂停时的检查点继续训练（同一 task_id / 模型目录）。
+
+        上游 train.py 启动时自动加载 logs/<model>/ 下最新 G/D 检查点，
+        因此只需按原运行配置重新拉起进程即可续训（无需重新预处理）。
+        """
+        if not self.can_resume():
+            raise ValueError("当前没有可继续的 So-VITS-SVC 训练任务")
+        ctx = dict(self._active_ctx or {})
+        log_dir = Path(str(ctx.get("log_dir") or ""))
+        config_path = Path(str(ctx.get("config_path") or ""))
+        if not config_path.is_file():
+            raise RuntimeError(f"训练配置不存在: {config_path}（无法续训）")
+        if not any(log_dir.glob("G_*.pth")):
+            raise RuntimeError(f"未找到检查点（{log_dir}/G_*.pth），无法续训")
+
+        # 清理可能残留的停止哨兵，避免引擎刚启动就再次退出
+        for name in (_STOP_SENTINEL_NAME, ".pause_requested"):
+            try:
+                (log_dir / name).unlink()
+            except FileNotFoundError:
+                pass
+
+        self._task_id = str(ctx.get("task_id") or uuid.uuid4())
+        ctx["task_id"] = self._task_id
+        args = [
+            self._python_path,
+            "train.py",
+            "-c", str(config_path),
+            "-m", str(ctx["output_name"]),
+        ]
+        epoch = _parse_last_epoch_from_file(log_dir / "train.log")
+        epochs = int(ctx["epochs"])
+        progress = min(epoch / epochs, 1.0) if epochs > 0 else 0.0
+        self._pause_requested = False
+        self._persist_train_state("running", epoch=epoch)
+        if progress_callback:
+            try:
+                progress_callback(
+                    status="running",
+                    progress=progress,
+                    epoch=epoch,
+                    total_epochs=epochs,
+                    message=f"训练继续中（从 epoch {epoch} 恢复）",
+                )
+            except Exception as exc:
+                logger.warning(f"Progress callback error: {exc}")
+
+        try:
+            proc = await self._spawn_train(args)
+        except BaseException:
+            self._persist_train_state("paused", epoch=epoch)
+            raise
+        self._process = proc
+        self._monitor_task = asyncio.create_task(
+            self._monitor_training(
+                epochs,
+                progress_callback,
+                proc,
+                str(ctx["output_name"]),
+                respawn=None,
+                batch_size=int(ctx.get("batch_size") or 0),
+            )
+        )
+        logger.info("So-VITS-SVC training resumed: task_id=%s", self._task_id)
+        return self._task_id
+
+    async def stop_training(self, *, preserve_resume: bool = False):
+        """停止训练（terminate→kill）；所有出口复位句柄。
+
+        preserve_resume=True：应用关闭/暂停兜底场景，状态落盘为 paused 而非
+        stopped，下次启动可从最近检查点继续训练。
+        """
+        ctx = dict(self._active_ctx) if self._active_ctx else None
         if self._process and self._process.returncode is None:
             # 跨平台一致：先 terminate 给一个优雅退出窗口，再 wait，超时再 kill。
             try:
@@ -618,7 +954,16 @@ class SoVITSSVCTrainer:
                     logger.debug(f"训练监控任务异常退出: {exc}")
         self._process = None
         self._monitor_task = None
-        logger.info("So-VITS-SVC training stopped")
+        self._pause_requested = False
+        if ctx:
+            log_dir = Path(str(ctx.get("log_dir") or ""))
+            epoch = _parse_last_epoch_from_file(log_dir / "train.log")
+            self._persist_train_state(
+                "paused" if preserve_resume else "stopped", ctx=ctx, epoch=epoch
+            )
+        if not preserve_resume:
+            self._active_ctx = None
+        logger.info("So-VITS-SVC training stopped (preserve_resume=%s)", preserve_resume)
 
     def export_model(
         self, model_name: str, dest_dir: str, checkpoint: str | None = None

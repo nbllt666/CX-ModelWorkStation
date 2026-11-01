@@ -129,15 +129,32 @@ def _get_trainer(rebuild: bool = False) -> "SoVITSSVCTrainer":
         "python_path": settings.sovits_svc.python_path,
     }
     new_hash = _hash_kwargs(kwargs)
+    created = False
     if _trainer_instance is None or (rebuild and _trainer_kwargs_hash != new_hash):
         _trainer_instance = SoVITSSVCTrainer(**kwargs)
         _trainer_kwargs_hash = new_hash
+        created = True
+    if created and _train_status["status"] == "idle":
+        # 应用重启后进程内状态为空：从磁盘恢复最近一次未完成的 sovits 训练为
+        # paused，让「继续训练」按钮在有检查点时可用（失败不影响正常启动）
+        try:
+            restored = _trainer_instance.restore_resumable_training()
+        except Exception as exc:
+            logger.warning(f"恢复 So-VITS-SVC 可续训训练失败（忽略）: {exc}")
+            restored = None
+        if restored:
+            _train_status.update(restored)
     return _trainer_instance
 
 
 def get_sovits_trainer() -> "SoVITSSVCTrainer":
     """对外导出的共享单例获取入口，供 workflow 等模块复用同一 trainer 实例。"""
     return _get_trainer()
+
+
+def get_train_status_snapshot() -> dict:
+    """训练状态只读快照（供一键成模等模块轮询共享状态，含 task_id）。"""
+    return dict(_train_status)
 
 
 @router.post("/preprocess")
@@ -294,6 +311,75 @@ async def stop_training():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/pause")
+async def pause_training():
+    """暂停训练：当前 epoch 边界保存检查点并退出（可继续）"""
+    trainer = None
+    try:
+        trainer = _get_trainer()
+        snapshot = await trainer.pause_training()
+        _train_status.update(
+            {k: v for k, v in snapshot.items() if k in _train_status}
+        )
+        # 暂停出口释放互斥；继续训练时重新占用（允许暂停期间临时做其它训练）
+        end_training(TRAINING_SOVITS_SVC)
+        return {
+            "status": "success",
+            "message": snapshot.get("message") or "训练已暂停",
+            "train": dict(_train_status),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        # 兜底强停后 trainer 仍保留可续训上下文：状态回填 paused，避免卡在 running
+        if trainer is not None and trainer.can_resume():
+            _train_status.update(
+                {
+                    "status": "paused",
+                    "total_epochs": int((trainer._active_ctx or {}).get("epochs") or 0),
+                    "message": str(e),
+                }
+            )
+            end_training(TRAINING_SOVITS_SVC)
+        logger.error(f"Failed to pause So-VITS-SVC training: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/resume")
+async def resume_training():
+    """继续训练：从暂停时保存的检查点恢复"""
+    with _train_lock:
+        if _train_status["status"] != "paused":
+            raise HTTPException(status_code=400, detail="当前没有可继续的 So-VITS-SVC 训练任务")
+        _train_status["status"] = "busy_starting"
+
+    mutex_ok, mutex_current = try_begin_training(
+        TRAINING_SOVITS_SVC, _train_status.get("task_id")
+    )
+    if not mutex_ok:
+        _train_status["status"] = "paused"
+        raise HTTPException(status_code=409, detail=_training_conflict_detail(mutex_current))
+
+    try:
+        trainer = _get_trainer()
+        task_id = await trainer.resume_training(
+            progress_callback=lambda **kw: _update_train_status(**kw)
+        )
+        update_training_task(TRAINING_SOVITS_SVC, task_id)
+        _train_status["task_id"] = task_id
+        _train_status["status"] = "running"
+        return {"status": "success", "task_id": task_id, "message": "训练已继续"}
+    except ValueError as e:
+        _train_status["status"] = "paused"
+        end_training(TRAINING_SOVITS_SVC)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _train_status["status"] = "paused"
+        end_training(TRAINING_SOVITS_SVC)
+        logger.error(f"Failed to resume So-VITS-SVC training: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/infer")
 async def infer(request: SVCInferRequest):
     """So-VITS-SVC 试听推理（对训练好的模型做推理验证，输出至 audition 受控目录）"""
@@ -375,7 +461,7 @@ def _update_train_status(**kwargs):
     for k, v in kwargs.items():
         if k in _train_status:
             _train_status[k] = v
-    # trainer 完成/失败回调出口：监控终态（completed/failed）到达时释放跨类型互斥。
-    # 仅该出口需要判断——逐 epoch 进度回调不带 status 键，重复 end_training 幂等无害。
-    if kwargs.get("status") in ("completed", "failed"):
+    # trainer 终态回调出口：completed/failed/paused 到达时释放跨类型互斥。
+    # 暂停释放槽位允许临时训练其它类型；resume 端点会重新占用。
+    if kwargs.get("status") in ("completed", "failed", "paused"):
         end_training(TRAINING_SOVITS_SVC)

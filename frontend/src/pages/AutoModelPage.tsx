@@ -9,7 +9,12 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api/client";
-import type { PipelineRunRequest, PipelineStageId } from "../api/client";
+import type {
+  MelottsTrainStatus,
+  PipelineRunRequest,
+  PipelineStageId,
+  TrainStatus,
+} from "../api/client";
 import { ErrorBar, NoticeBar, StatusBadge } from "../components/ui";
 import TrainLogPanel from "../components/TrainLogPanel";
 import { usePolling } from "../hooks/usePolling";
@@ -116,16 +121,23 @@ export default function AutoModelPage() {
   // 仅展示当前 run_id 的数据，避免提交新一轮后短暂展示上一轮残影
   const activeRun = run && run.run_id === runId ? run : null;
 
-  // 训练阶段暂停/继续（仅 MeloTTS）：暂停态由训练器状态驱动；
+  // 训练阶段暂停/继续：暂停态由训练器状态驱动（sovits/melotts 同语义）；
   // 暂停时管道任务不会终止，仍继续轮询等待恢复
   const trainingRunning =
     activeRun?.status === "running" &&
-    activeRun.model_type === "melotts" &&
     activeRun.stages.some((s) => s.id === "training" && s.status === "running");
-  const { data: trainStatus } = usePolling(
-    useCallback(() => api.getMelottsStatus(), []),
-    { intervalMs: 3000, enabled: trainingRunning },
+  const trainStatusSource = activeRun?.model_type === "sovits" ? "sovits" : "melotts";
+  const fetchTrainStatus = useCallback(
+    async (): Promise<TrainStatus | MelottsTrainStatus> =>
+      trainStatusSource === "sovits"
+        ? api.getTrainStatus()
+        : api.getMelottsStatus(),
+    [trainStatusSource],
   );
+  const { data: trainStatus } = usePolling(fetchTrainStatus, {
+    intervalMs: 3000,
+    enabled: trainingRunning,
+  });
   const trainPaused = trainStatus?.status === "paused";
 
   // 参考音频试听任务轮询（复用批量任务查询端点）
@@ -299,13 +311,16 @@ export default function AutoModelPage() {
     }
   };
 
-  /** 暂停 MeloTTS 训练：引擎在 epoch 边界保存检查点后退出，管道任务继续等待 */
+  /** 暂停训练：引擎在 epoch 边界保存检查点后退出，管道任务继续等待 */
   const handlePauseTraining = async () => {
     setActionError(null);
     setNotice(null);
     setBusy(true);
     try {
-      const res = await api.pauseMelottsTrain();
+      const res =
+        activeRun?.model_type === "sovits"
+          ? await api.pauseSovitsTrain()
+          : await api.pauseMelottsTrain();
       setNotice(res.message);
       refresh();
     } catch (e) {
@@ -315,13 +330,16 @@ export default function AutoModelPage() {
     }
   };
 
-  /** 继续 MeloTTS 训练：从暂停时保存的检查点续跑 */
+  /** 继续训练：从暂停时保存的检查点续跑 */
   const handleResumeTraining = async () => {
     setActionError(null);
     setNotice(null);
     setBusy(true);
     try {
-      const res = await api.resumeMelottsTrain();
+      const res =
+        activeRun?.model_type === "sovits"
+          ? await api.resumeSovitsTrain()
+          : await api.resumeMelottsTrain();
       setNotice(res.message);
       refresh();
     } catch (e) {
@@ -626,14 +644,14 @@ export default function AutoModelPage() {
               训练已暂停（epoch {trainStatus?.epoch}），检查点已保存；点「继续训练」从该检查点续跑
             </p>
           ) : null}
-          {activeRun.model_type === "melotts" ? (
+          {trainingRunning || trainPaused || activeRun.model_type === "melotts" ? (
             <div className="form-actions">
-              {trainingRunning ? (
+              {trainingRunning || trainPaused ? (
                 <>
                   <button
                     type="button"
                     className="btn btn-ghost"
-                    disabled={busy || trainStatus?.status !== "running"}
+                    disabled={busy || !trainingRunning || trainPaused}
                     onClick={() => void handlePauseTraining()}
                   >
                     暂停训练
@@ -651,13 +669,15 @@ export default function AutoModelPage() {
                   </span>
                 </>
               ) : null}
-              <button
-                type="button"
-                className="btn btn-ghost"
-                onClick={() => setLogOpen((open) => !open)}
-              >
-                {logOpen ? "收起详细日志" : "查看详细日志"}
-              </button>
+              {activeRun.model_type === "melotts" ? (
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => setLogOpen((open) => !open)}
+                >
+                  {logOpen ? "收起详细日志" : "查看详细日志"}
+                </button>
+              ) : null}
             </div>
           ) : null}
         </section>
