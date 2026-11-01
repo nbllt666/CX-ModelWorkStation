@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------
+# CXO-ModelStation .gitignore
+# ---------------------------------------------------------------
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.pyd
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+envs/
+
+# ---------- Node / Electron ----------
+node_modules/
+dist/
+dist-electron/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- 构建产物 ----------
+build/
+release/
+release-nsis-trial/
+*.spec
+*.exe
+*.msi
+*.log
+
+# ---------- 运行时数据与模型 ----------
+data/**
+!data/**/
+!data/**/.gitkeep
+engines/
+
+# ---------- 本地配置与凭证 ----------
+.env
+.env.*
+!.env.example
+*.local
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
