@@ -64,6 +64,11 @@ logger = logging.getLogger(__name__)
 
 _OUTPUT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# 可续训状态落盘：应用关闭后 _active_ctx/_train_status 全部丢失，需在引擎 logs
+# 目录保留一份 train_state.json，重启时据此恢复 paused 态（继续训练入口）。
+_TRAIN_STATE_FILENAME = "train_state.json"
+_RESUMABLE_STATE_STATUSES = frozenset({"paused", "running", "busy_starting"})
+
 # 自适应 batch 参数（本机实测保守标定：MeloTTS 单样本+模型常驻开销更大）
 _PER_SAMPLE_GB = 1.8
 _VRAM_RESERVE_GB = 2.0
@@ -371,6 +376,138 @@ class MeloTTSTrainer:
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
         )
 
+    def _build_train_env(self) -> dict:
+        """训练子进程环境（单卡 env://；MASTER_PORT 每次重选，避免续训撞旧端口）。"""
+        return {
+            **os.environ,
+            "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1",
+            "LOCAL_RANK": "0",
+            "RANK": "0",
+            "WORLD_SIZE": "1",
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(_pick_free_port()),
+        }
+
+    def _train_state_path(self, output_name: str) -> Path:
+        """可续训状态文件路径（与引擎检查点同目录：logs/<output_name>/）。"""
+        return self.melo_dir / "logs" / output_name / _TRAIN_STATE_FILENAME
+
+    def _persist_train_state(
+        self,
+        status: str,
+        *,
+        ctx: Optional[dict] = None,
+        epoch: Optional[int] = None,
+    ) -> None:
+        """把续训所需上下文原子落盘；失败仅告警，不影响训练主链路。"""
+        context = dict(ctx or self._active_ctx or {})
+        output_name = str(context.get("output_name") or "")
+        if not output_name:
+            return
+        payload = {
+            "task_id": context.get("task_id"),
+            "output_name": output_name,
+            "epochs": int(context.get("epochs") or 0),
+            "batch_size": int(context.get("batch_size") or 0),
+            "config_path": str(context.get("config_path") or ""),
+            "base_ckpt": str(context.get("base_ckpt") or ""),
+            "log_dir": str(context.get("log_dir") or ""),
+            "status": status,
+            "epoch": int(
+                epoch if epoch is not None else (_train_status.get("epoch") or 0)
+            ),
+            "updated_at": time.time(),
+        }
+        path = self._train_state_path(output_name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("写入续训状态失败（忽略）: %s (%s)", path, exc)
+
+    def restore_resumable_training(self) -> bool:
+        """应用重启后把磁盘上最近一次中断的训练恢复为 paused（可点「继续训练」）。
+
+        进程内状态在应用关闭时全部丢失（_active_ctx / _train_status），这里只读取
+        logs/<output_name>/{train_state.json} 重建续训上下文；只看最近一次训练会话
+        （updated_at 最大），避免把历史暂停任务翻出来。仅 idle 态且无上下文时生效。
+        """
+        if self._active_ctx is not None or _train_status.get("status") != "idle":
+            return False
+        logs_root = self.melo_dir / "logs"
+        if not logs_root.is_dir():
+            return False
+        latest: Optional[tuple[float, Path, dict]] = None
+        for state_path in logs_root.glob(f"*/{_TRAIN_STATE_FILENAME}"):
+            try:
+                data = json.loads(state_path.read_text(encoding="utf-8"))
+                updated = float(data.get("updated_at") or 0.0)
+            except (OSError, ValueError, TypeError):
+                continue
+            if latest is None or updated > latest[0]:
+                latest = (updated, state_path, data)
+        if latest is None:
+            return False
+        _, state_path, data = latest
+        output_name = state_path.parent.name
+        try:
+            _sanitize_output_name(output_name)
+        except ValueError:
+            return False
+        if str(data.get("status") or "") not in _RESUMABLE_STATE_STATUSES:
+            return False
+        try:
+            epochs = int(data.get("epochs") or 0)
+            batch_size = int(data.get("batch_size") or 0)
+            stored_epoch = int(data.get("epoch") or 0)
+        except (TypeError, ValueError):
+            return False
+        config_path = Path(str(data.get("config_path") or ""))
+        log_dir = state_path.parent
+        if epochs < 1 or not config_path.is_file():
+            return False
+        # 没有任何 G 检查点（例如训练在首个 eval_interval 前就中断）无从续训
+        if not any(log_dir.glob("G_*.pth")):
+            return False
+
+        epoch = max(
+            _parse_last_epoch_from_file(log_dir / "train.log"), stored_epoch
+        )
+        progress = min(epoch / epochs, 1.0) if epochs > 0 else 0.0
+        self._active_ctx = {
+            "task_id": data.get("task_id") or str(uuid.uuid4()),
+            "output_name": output_name,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "config_path": str(config_path),
+            "base_ckpt": str(data.get("base_ckpt") or ""),
+            "log_dir": str(log_dir),
+        }
+        self._last_log_path = log_dir / "train.log"
+        _update_train_status(
+            task_id=self._active_ctx["task_id"],
+            status="paused",
+            progress=progress,
+            epoch=epoch,
+            total_epochs=epochs,
+            message=(
+                f"检测到上次未完成的训练 {output_name}（epoch {epoch}），"
+                "检查点已就绪，可点击「继续训练」从该检查点恢复"
+            ),
+            started_at=None,
+            phase="",
+            eta_seconds=None,
+        )
+        logger.info(
+            "已恢复可续训的 MeloTTS 训练: output=%s epoch=%d state=%s",
+            output_name, epoch, state_path,
+        )
+        return True
+
     # ------------------------------------------------------------------
     # prep 产物定位与官方清洗结果重分
     # ------------------------------------------------------------------
@@ -642,9 +779,6 @@ class MeloTTSTrainer:
         if not float(learning_rate) > 0:
             raise ValueError(f"learning_rate must be > 0, got: {learning_rate}")
 
-        # 引擎侧环境（显存探测与训练子进程共用）
-        engine_env = {**os.environ, "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1"}
-
         task_id = str(uuid.uuid4())
         if output_name:
             output_name = _sanitize_output_name(output_name)
@@ -762,14 +896,7 @@ class MeloTTSTrainer:
             )
 
             # Step 4: train.py 子进程（单卡 env://，world_size=1）
-            env = dict(engine_env)
-            env.update({
-                "LOCAL_RANK": "0",
-                "RANK": "0",
-                "WORLD_SIZE": "1",
-                "MASTER_ADDR": "127.0.0.1",
-                "MASTER_PORT": str(_pick_free_port()),
-            })
+            env = self._build_train_env()
             train_args = [
                 "train.py",
                 "--c", str(config_path.resolve()),
@@ -793,13 +920,19 @@ class MeloTTSTrainer:
                 )
                 if self._active_ctx is not None:
                     self._active_ctx["batch_size"] = int(batch)
+                    # OOM 降批后同步落盘，重启续训沿用新的 batch
+                    self._persist_train_state(
+                        "running"
+                        if _train_status.get("status") == "running"
+                        else "busy_starting"
+                    )
                 return await self._spawn_train(args, cwd=melo_dir, env=env)
 
             logger.info(
                 "Starting MeloTTS training: %s (output=%s, epochs=%d, batch=%d, lr=%g)",
                 task_id, output_name, epochs, batch_size, learning_rate,
             )
-            # 暂停/继续上下文：进程被优雅暂停后，按此重建同样的训练命令
+            # 暂停/继续上下文：进程被优雅暂停/应用重启后，按此重建同样的训练命令
             self._active_ctx = {
                 "task_id": task_id,
                 "output_name": output_name,
@@ -807,12 +940,13 @@ class MeloTTSTrainer:
                 "eval_interval": eval_interval,
                 "config_path": str(config_path.resolve()),
                 "base_ckpt": effective_base_ckpt or "",
-                "env": dict(env),
                 "batch_size": int(batch_size),
                 "learning_rate": float(learning_rate),
                 "log_dir": str((melo_dir / "logs" / output_name).resolve()),
             }
             self._last_log_path = Path(self._active_ctx["log_dir"]) / "train.log"
+            # 先落盘再拉起进程：应用被强杀（Electron taskkill /T）时也能恢复
+            self._persist_train_state("busy_starting", epoch=0)
             _update_train_status(phase="launch", message="拉起训练进程")
             proc = await _spawn_with_batch(batch_size)
             self._process = proc
@@ -828,9 +962,11 @@ class MeloTTSTrainer:
                 )
             )
             _update_train_status(status="running", phase="training", message="训练进行中")
+            self._persist_train_state("running", epoch=0)
             return task_id
         except BaseException as exc:
             # 启动失败/异常：释放互斥（幂等）+ 状态复位，允许后续重试
+            self._persist_train_state("failed")
             self._active_ctx = None
             end_training(TRAINING_MELOTTS)
             _update_train_status(status="idle", message=f"训练启动失败: {exc}")
@@ -1079,7 +1215,13 @@ class MeloTTSTrainer:
             self._process = None
             if self._monitor_task is asyncio.current_task():
                 self._monitor_task = None
-            if _train_status.get("status") != "paused":
+            final_status = str(_train_status.get("status") or "")
+            # 终态落盘：paused 供重启后续训；completed/failed 标记为不可续训
+            if final_status in ("paused", "completed", "failed"):
+                self._persist_train_state(
+                    final_status, epoch=int(_train_status.get("epoch") or 0)
+                )
+            if final_status != "paused":
                 self._active_ctx = None
             # 所有出口释放互斥（end_training 幂等；仅持有者匹配时生效）
             end_training(TRAINING_MELOTTS)
@@ -1150,10 +1292,10 @@ class MeloTTSTrainer:
                     return get_train_status()
                 break
             await asyncio.sleep(0.5)
-        # 兜底：若引擎未响应哨兵，退回强停（保留最近一次检查点）
+        # 兜底：若引擎未响应哨兵，退回强停（保留最近一次检查点，仍可续训）
         if _train_status.get("status") != "paused":
             logger.warning("暂停哨兵未在 %.0fs 内生效，退回强制停止", timeout)
-            await self.stop_training()
+            await self.stop_training(preserve_resume=True)
             raise RuntimeError("暂停超时，已强制停止训练（产物取最近检查点）")
         return get_train_status()
 
@@ -1206,11 +1348,14 @@ class MeloTTSTrainer:
             eta_seconds=None,
             total_epochs=int(ctx["epochs"]),
         )
+        self._persist_train_state("running", epoch=int(_train_status.get("epoch") or 0))
         try:
-            proc = await self._spawn_train(args, cwd=self.melo_dir, env=ctx["env"])
+            # 环境不落盘（含 MASTER_PORT 等易变值），续训时按当前进程重建
+            proc = await self._spawn_train(args, cwd=self.melo_dir, env=self._build_train_env())
         except BaseException as exc:
             end_training(TRAINING_MELOTTS)
             _update_train_status(status="paused", message=f"继续训练失败: {exc}")
+            self._persist_train_state("paused", epoch=int(_train_status.get("epoch") or 0))
             raise
 
         self._process = proc
@@ -1228,8 +1373,13 @@ class MeloTTSTrainer:
         logger.info("MeloTTS training resumed: task_id=%s", ctx["task_id"])
         return str(ctx["task_id"])
 
-    async def stop_training(self) -> None:
-        """停止训练：terminate→kill 链路（对齐 sovits trainer）；所有出口释放互斥。"""
+    async def stop_training(self, *, preserve_resume: bool = False) -> None:
+        """停止训练：terminate→kill 链路（对齐 sovits trainer）；所有出口释放互斥。
+
+        preserve_resume=True：应用关闭/暂停兜底场景，状态落盘为 paused 而非
+        stopped，下次启动可从最近检查点继续训练。
+        """
+        ctx = dict(self._active_ctx) if self._active_ctx else None
         await self._terminate_proc(self._process)
         if self._monitor_task is not None and not self._monitor_task.done():
             self._monitor_task.cancel()
@@ -1244,12 +1394,24 @@ class MeloTTSTrainer:
         self._process = None
         self._monitor_task = None
         self._active_ctx = None
+        epoch = int(_train_status.get("epoch") or 0)
         _update_train_status(
-            status="stopped", message="训练已停止", eta_seconds=None, phase=""
+            status="paused" if preserve_resume else "stopped",
+            message=(
+                "训练已中止，检查点已保留，可从该检查点继续训练"
+                if preserve_resume
+                else "训练已停止"
+            ),
+            eta_seconds=None,
+            phase="",
         )
+        if ctx:
+            self._persist_train_state(
+                "paused" if preserve_resume else "stopped", ctx=ctx, epoch=epoch
+            )
         # stop 出口释放互斥（幂等：monitor finally 已释放时此处无害）
         end_training(TRAINING_MELOTTS)
-        logger.info("MeloTTS training stopped")
+        logger.info("MeloTTS training stopped (preserve_resume=%s)", preserve_resume)
 
     def read_log_tail(self, lines: int = 200) -> dict:
         """读取当前/最近一次训练日志尾部（训练监控与排障用）。
@@ -1351,6 +1513,12 @@ def get_trainer() -> MeloTTSTrainer:
 
         _trainer_instance = MeloTTSTrainer(**kwargs)
         _trainer_kwargs_hash = new_hash
+        # 应用重启后进程内状态为空：从磁盘恢复最近一次未完成的训练为 paused，
+        # 让「继续训练」按钮在有检查点时可用（失败不影响正常启动）
+        try:
+            _trainer_instance.restore_resumable_training()
+        except Exception as exc:
+            logger.warning("恢复可续训训练失败（忽略）: %s", exc)
     return _trainer_instance
 
 

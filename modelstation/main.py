@@ -49,7 +49,8 @@ async def _shutdown_resources():
         from modelstation.services import melotts_trainer as melotts_trainer_module
         melotts_trainer = melotts_trainer_module._trainer_instance
         if melotts_trainer is not None:
-            await melotts_trainer.stop_training()
+            # 应用关闭时保留可续训状态：下次启动可从最近检查点继续训练
+            await melotts_trainer.stop_training(preserve_resume=True)
     except Exception as e:
         logger.warning(f"Shutdown: failed to stop MeloTTS training: {e}")
 

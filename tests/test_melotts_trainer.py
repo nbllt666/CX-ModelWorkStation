@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -127,7 +128,13 @@ def trainer_env(monkeypatch, tmp_path):
     # prep 缺省 output_dir 依赖 get_settings → 补丁到 tmp
     def _fake_settings():
         return ModelStationSettings.model_validate(
-            {"melotts": {"training_data_dir": str(training_data_dir)}}
+            {
+                "melotts": {
+                    "engine_dir": str(engine_dir),
+                    "training_data_dir": str(training_data_dir),
+                    "models_dir": str(models_dir),
+                }
+            }
         )
 
     monkeypatch.setattr(config_module, "get_settings", _fake_settings)
@@ -688,3 +695,142 @@ async def test_resume_conflicts_with_other_training(trainer_env):
     # 冲突不污染状态：仍是 paused，可稍后重试
     assert get_train_status()["status"] == "paused"
     assert trainer.can_resume()
+
+
+# ---------------------------------------------------------------------------
+# 应用重启后从检查点续训（train_state.json 落盘 + 启动恢复）
+# ---------------------------------------------------------------------------
+
+
+def _new_trainer(paths: dict) -> MeloTTSTrainer:
+    """按同一引擎/数据路径构造新 trainer 实例（模拟应用重启后的新进程）。"""
+    return MeloTTSTrainer(
+        engine_dir=str(paths["engine_dir"]),
+        training_data_dir=str(paths["training_data_dir"]),
+        models_dir=str(paths["models_dir"]),
+        python_path="python",
+        language="ZH",
+    )
+
+
+@pytest.mark.asyncio
+async def test_paused_training_survives_app_restart(trainer_env):
+    """暂停后关闭应用再打开：新实例从 train_state.json 恢复 paused，可继续训练"""
+    trainer, paths = trainer_env
+    _make_prep(trainer, paths)
+    _patch_fake_run_subprocess(trainer)
+    calls = _patch_pausing_spawn(trainer, delay=1.2)
+
+    await trainer.start_training(epochs=100, batch_size=2, output_name="restart_case")
+    await trainer.pause_training(timeout=5.0)
+    await _wait_for_mutex_release()
+
+    state_file = paths["melo_dir"] / "logs" / "restart_case" / "train_state.json"
+    assert state_file.is_file()
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert persisted["status"] == "paused"
+    assert persisted["epoch"] == 4
+    assert Path(persisted["config_path"]).is_file()
+
+    # 模拟应用重启：进程内状态全部丢失，新 trainer 从磁盘恢复
+    mt.reset_train_status()
+    fresh = _new_trainer(paths)
+    assert fresh.restore_resumable_training()
+    st = get_train_status()
+    assert st["status"] == "paused"
+    assert st["epoch"] == 4
+    assert st["total_epochs"] == 100
+    assert "检测到上次未完成的训练" in st["message"]
+    assert fresh.can_resume()
+
+    resumed_calls = _patch_pausing_spawn(fresh, delay=0.05)
+    task_id = await fresh.resume_training()
+    assert task_id == persisted["task_id"]
+    assert len(resumed_calls) == 1
+    assert resumed_calls[0][resumed_calls[0].index("--model") + 1] == "restart_case"
+    await fresh.stop_training()
+
+
+@pytest.mark.asyncio
+async def test_get_trainer_restores_paused_state_after_restart(trainer_env):
+    """单例工厂重建时（应用启动首个请求）自动恢复 paused 态"""
+    trainer, paths = trainer_env
+    _make_prep(trainer, paths)
+    _patch_fake_run_subprocess(trainer)
+    _patch_pausing_spawn(trainer, delay=1.2)
+
+    await trainer.start_training(epochs=100, batch_size=2, output_name="factory_case")
+    await trainer.pause_training(timeout=5.0)
+    await _wait_for_mutex_release()
+
+    mt.reset_train_status()
+    mt.reset_trainer()
+    fresh = mt.get_trainer()
+    assert get_train_status()["status"] == "paused"
+    assert fresh.can_resume()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_running_state_restored_as_paused(trainer_env):
+    """应用被强杀（状态停在 running）→ 重启恢复为 paused，epoch 取日志最新值"""
+    _, paths = trainer_env
+    log_dir = paths["melo_dir"] / "logs" / "killed_case"
+    log_dir.mkdir(parents=True)
+    (log_dir / "G_2000.pth").write_bytes(b"fake-g-ckpt")
+    (log_dir / "train.log").write_text("====> Epoch: 7\n", encoding="utf-8")
+    config_path = paths["base"] / "run_config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    state = {
+        "task_id": "tid-killed",
+        "output_name": "killed_case",
+        "epochs": 100,
+        "batch_size": 2,
+        "config_path": str(config_path),
+        "base_ckpt": "",
+        "log_dir": str(log_dir),
+        "status": "running",
+        "epoch": 0,
+        "updated_at": time.time(),
+    }
+    (log_dir / "train_state.json").write_text(
+        json.dumps(state, ensure_ascii=False), encoding="utf-8"
+    )
+
+    fresh = _new_trainer(paths)
+    assert fresh.restore_resumable_training()
+    st = get_train_status()
+    assert st["status"] == "paused"
+    assert st["epoch"] == 7
+    assert st["progress"] == pytest.approx(0.07)
+    assert fresh.can_resume()
+
+
+@pytest.mark.asyncio
+async def test_completed_or_stopped_training_not_restored(trainer_env):
+    """最近一次训练已完成/主动停止 → 重启不恢复恢复态（不回翻旧检查点）"""
+    trainer, paths = trainer_env
+    _make_prep(trainer, paths)
+    _patch_fake_run_subprocess(trainer)
+    proc = FakeProc(exit_code=0, delay=0.05)
+    _patch_fake_spawn(trainer, paths, proc)
+
+    await trainer.start_training(epochs=10, batch_size=2, output_name="done_case")
+    await _wait_for_status("completed")
+    await _wait_for_mutex_release()
+    state_file = paths["melo_dir"] / "logs" / "done_case" / "train_state.json"
+    assert json.loads(state_file.read_text(encoding="utf-8"))["status"] == "completed"
+
+    mt.reset_train_status()
+    fresh = _new_trainer(paths)
+    assert not fresh.restore_resumable_training()
+    assert get_train_status()["status"] == "idle"
+    assert not fresh.can_resume()
+
+    # 主动停止（stopped）同样不恢复：最近一次会话是用户明确结束的
+    proc2 = FakeProc(exit_code=0, delay=5.0)
+    _patch_fake_spawn(trainer, paths, proc2)
+    await trainer.start_training(epochs=10, batch_size=2, output_name="stop_case")
+    await trainer.stop_training()
+    mt.reset_train_status()
+    fresh2 = _new_trainer(paths)
+    assert not fresh2.restore_resumable_training()
