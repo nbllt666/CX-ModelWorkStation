@@ -38,9 +38,11 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir={#OutputDir}
 OutputBaseFilename=CXO-ModelStation-Setup-{#AppVersion}
-; 载荷含 ~5.6GB 运行时/引擎，normal + 非固实压缩（编译速度优先，收益有限）
-Compression=lzma2/normal
-SolidCompression=no
+; 载荷含 ~5.6GB 运行时/引擎：最高压缩（lzma2/ultra64 + 固实），优先减小安装包体积；
+; 单独压缩进程避免 32 位编译器在大载荷固实压缩时内存不足
+Compression=lzma2/ultra64
+SolidCompression=yes
+LZMAUseSeparateProcess=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible

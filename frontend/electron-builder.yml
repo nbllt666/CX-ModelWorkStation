@@ -14,6 +14,9 @@
 appId: com.cxo.modelstation
 productName: CXO-ModelStation
 
+# 安装包压缩：maximum（7z/NSIS 使用最高压缩等级），显著减小体积（打包耗时增加）
+compression: maximum
+
 directories:
   output: ../release
 
@@ -55,6 +58,12 @@ extraResources:
       - "!**/__pycache__/**"
       - "!**/*.pyc"
       - "!**/.pytest_cache/**"
+      # 仅编译期使用的头文件 / 导入库，运行训练与推理不需要
+      - "!python/Lib/site-packages/torch/include/**"
+      - "!**/*.lib"
+      # 第三方包自带的测试用例（运行时不会被 import）
+      - "!**/tests/**"
+      - "!**/test/**"
 
 # 无可重建原生依赖（便携运行时已自带），跳过 npm rebuild 加速打包
 npmRebuild: false
